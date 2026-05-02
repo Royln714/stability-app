@@ -1,0 +1,8 @@
+node_modules/
+client/node_modules/
+uploads/
+backups/
+stability_data.json
+*.tmp
+.env
+.env.local
