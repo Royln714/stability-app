@@ -3,6 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import { getFormulation, updateFormulation, createFormulation, uploadLogo, uploadRefImage, getSamples } from '../api'
 import { generateFormulationPDF } from '../pdfReport'
 import { searchIngredients } from '../ingredientDB'
+import * as XLSX from 'xlsx'
 
 let _id = Date.now()
 const uid = () => ++_id
@@ -362,6 +363,7 @@ export default function FormulationSheet() {
   const [duplicating, setDuplicating] = useState(false)
   const saveTimer = useRef(null)
   const formDirty = useRef(false)
+  const importRef = useRef(null)
 
   useEffect(() => {
     getFormulation(id).then(setForm).catch(() => navigate('/formulations'))
@@ -413,6 +415,113 @@ export default function FormulationSheet() {
     } finally { setDuplicating(false) }
   }
 
+  function handleImport(e) {
+    const file = e.target.files[0]
+    if (!file) return
+    e.target.value = ''
+    const reader = new FileReader()
+    reader.onload = evt => {
+      const wb = XLSX.read(evt.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+      if (!raw.length) return alert('No data found in file.')
+
+      const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9%]/g, '')
+      const fuzzy = (h, aliases) => { const n = norm(h); if (!n) return false; return aliases.some(a => n === a || n.includes(a)) }
+
+      const ING_ALIASES = {
+        part:        ['part', 'phase', 'section'],
+        trade_name:  ['tradename', 'ingredient', 'ingredientname', 'material', 'rawmaterial', 'chemical', 'substance'],
+        description: ['description', 'desc', 'details'],
+        inci_name:   ['inci', 'inciname'],
+        cas_no:      ['cas', 'casno', 'casnumber', 'casrn'],
+        percent:     ['%', 'percent', 'percentage', 'ww', 'concentration', 'amount', 'quantity'],
+        supplier:    ['supplier', 'principal', 'vendor', 'manufacturer', 'brand'],
+        function:    ['function', 'role', 'purpose'],
+        compliance:  ['compliance', 'regulation', 'remark', 'remarks', 'note', 'notes'],
+      }
+
+      // Find header row — first row where ≥2 cells match ingredient column aliases
+      // Find header row — first row with ≥2 ingredient column matches
+      let headerRowIdx = -1
+      for (let i = 0; i < Math.min(raw.length, 20); i++) {
+        const matches = raw[i].filter(cell => Object.values(ING_ALIASES).some(a => fuzzy(cell, a))).length
+        if (matches >= 2) { headerRowIdx = i; break }
+      }
+
+      // Scan top rows for product name and ref no
+      const formUpdates = {}
+      const refPattern = /[A-Z]{2,}\d{3,}/
+      const scanLimit = headerRowIdx < 0 ? Math.min(raw.length, 10) : headerRowIdx
+      for (let i = 0; i < scanLimit; i++) {
+        for (const cell of raw[i]) {
+          const val = String(cell).trim()
+          if (!val) continue
+          if (!formUpdates.ref_no && refPattern.test(val)) formUpdates.ref_no = val
+          else if (!formUpdates.product_name && val.length > 3 && isNaN(Number(val))) formUpdates.product_name = val
+        }
+      }
+
+      if (headerRowIdx < 0) {
+        const found = Object.keys(formUpdates)
+        if (found.length) {
+          formDirty.current = true
+          setForm(f => ({ ...f, ...formUpdates }))
+          return alert(`✓ Filled: ${found.join(', ')}\n\nNo ingredient table found.`)
+        }
+        return alert('Could not find an ingredient table. Ensure column headers include: Trade Name, INCI Name, %, Supplier, Function')
+      }
+
+      const headers = raw[headerRowIdx]
+
+      // Map ingredient fields to column indices
+      const colMap = {}
+      for (const [field, aliases] of Object.entries(ING_ALIASES)) {
+        const idx = headers.findIndex(h => fuzzy(h, aliases))
+        if (idx >= 0) colMap[field] = idx
+      }
+
+      // Detect part column — first column whose header is empty but data rows contain single letters like A/B/C
+      const partColIdx = colMap.part !== undefined ? colMap.part
+        : (() => {
+            for (let c = 0; c < Math.min(headers.length, 4); c++) {
+              if (String(headers[c]).trim()) continue // skip named columns
+              const sample = raw.slice(headerRowIdx + 1, headerRowIdx + 10).map(r => String(r[c] || '').trim())
+              if (sample.some(v => /^[A-Z]$/.test(v))) return c
+            }
+            return -1
+          })()
+
+      // Extract bulk size from headers like "300g" or "500g"
+      const bulkMatch = headers.map(h => String(h).match(/^(\d+)\s*g$/i)).find(Boolean)
+      if (bulkMatch) formUpdates.bulk_size = bulkMatch[1]
+
+      // Parse ingredient rows, propagating part letter down blank cells
+      let currentPart = ''
+      const imported = []
+      for (const row of raw.slice(headerRowIdx + 1)) {
+        if (!row.some(c => String(c).trim())) continue
+        const ing = { id: uid() }
+        for (const [field, idx] of Object.entries(colMap)) {
+          if (field === 'part') continue
+          ing[field] = String(row[idx] ?? '').trim()
+        }
+        // Part: use detected part column, carry forward if blank
+        if (partColIdx >= 0) {
+          const p = String(row[partColIdx] || '').trim()
+          if (/^[A-Z]$/.test(p)) currentPart = p
+          ing.part = currentPart
+        }
+        if (ing.trade_name || ing.inci_name || ing.percent) imported.push(ing)
+      }
+
+      formDirty.current = true
+      setForm(f => ({ ...f, ...formUpdates, ingredients: [...(f.ingredients || []), ...imported] }))
+      alert(`✓ Done!\nFilled: ${Object.keys(formUpdates).join(', ') || 'none'}\nIngredient rows: ${imported.length}\nColumns: ${Object.keys(colMap).join(', ')}`)
+    }
+    reader.readAsArrayBuffer(file)
+  }
+
   function downloadCSV() {
     const cols = mergeColOrder(form.col_order)
     const effRows = getEffRows(form.ingredients || [], form.qs_enabled)
@@ -449,6 +558,8 @@ export default function FormulationSheet() {
         </div>
         <div className="flex items-center gap-2">
           <button className="btn-secondary text-xs" onClick={downloadCSV}>⬇ CSV</button>
+          <button className="btn-secondary text-xs" onClick={() => importRef.current.click()}>⬆ Import Excel/CSV</button>
+          <input ref={importRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleImport} />
           <button className="btn-secondary text-xs" onClick={handleDuplicate} disabled={duplicating}>
             {duplicating ? 'Duplicating...' : '⧉ Duplicate'}
           </button>
