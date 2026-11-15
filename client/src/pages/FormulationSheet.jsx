@@ -50,6 +50,17 @@ function mergeColOrder(saved) {
   return [...filtered, ...missing]
 }
 
+function mergeImportedSpecs(existing, imported) {
+  const merged = [...existing]
+  for (const spec of imported) {
+    const index = merged.findIndex(item =>
+      String(item.property || '').trim().toLowerCase() === spec.property.toLowerCase())
+    if (index < 0) merged.push(spec)
+    else merged[index] = { ...merged[index], value: spec.value }
+  }
+  return merged
+}
+
 // ── EditCell ──────────────────────────────────────────────────────────────────
 
 function EditCell({ value, onChange, type = 'text', placeholder = '', align = 'left' }) {
@@ -429,6 +440,10 @@ export default function FormulationSheet() {
       const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9%]/g, '')
       const fuzzy = (h, aliases) => { const n = norm(h); if (!n) return false; return aliases.some(a => n === a || n.includes(a)) }
 
+      const FORM_ALIASES = {
+        product_name: ['productname', 'nameofproduct', 'formulationname'],
+        ref_no: ['ref', 'refno', 'refnumber', 'referenceno', 'referencenumber', 'productref', 'productcode', 'formulationref'],
+      }
       const ING_ALIASES = {
         part:        ['part', 'phase', 'section'],
         trade_name:  ['tradename', 'ingredient', 'ingredientname', 'material', 'rawmaterial', 'chemical', 'substance'],
@@ -449,25 +464,85 @@ export default function FormulationSheet() {
         if (matches >= 2) { headerRowIdx = i; break }
       }
 
-      // Scan top rows for product name and ref no
       const formUpdates = {}
-      const refPattern = /[A-Z]{2,}\d{3,}/
+      const scalarLabels = new Set(Object.values(FORM_ALIASES).flat())
       const scanLimit = headerRowIdx < 0 ? Math.min(raw.length, 10) : headerRowIdx
+      for (let i = 0; i < scanLimit; i++) {
+        for (let c = 0; c < raw[i].length; c++) {
+          const label = norm(raw[i][c])
+          const field = Object.keys(FORM_ALIASES).find(key => FORM_ALIASES[key].includes(label))
+          if (!field || formUpdates[field]) continue
+          const right = String(raw[i][c + 1] ?? '').trim()
+          const below = String(raw[i + 1]?.[c] ?? '').trim()
+          const value = right && !scalarLabels.has(norm(right)) ? right : below
+          if (value) formUpdates[field] = value
+        }
+      }
+
+      const refPattern = /[A-Z]{2,}\d{3,}/
       for (let i = 0; i < scanLimit; i++) {
         for (const cell of raw[i]) {
           const val = String(cell).trim()
           if (!val) continue
-          if (!formUpdates.ref_no && refPattern.test(val)) formUpdates.ref_no = val
-          else if (!formUpdates.product_name && val.length > 3 && isNaN(Number(val))) formUpdates.product_name = val
+          if (!formUpdates.ref_no && !scalarLabels.has(norm(val)) && refPattern.test(val)) formUpdates.ref_no = val
+        }
+      }
+
+      const specSectionIdx = raw.findIndex(row => row.some(cell =>
+        ['productspec', 'productspecification', 'productspecifications', 'specifications'].includes(norm(cell))))
+      const specHeaderAliases = {
+        property: ['property', 'test', 'parameter', 'characteristic', 'item', 'attribute', 'specification', 'productspecification'],
+        value: ['value', 'spec', 'specification', 'requirement', 'target', 'result', 'acceptancecriteria', 'standard', 'limit'],
+      }
+      const specHeaderIdx = raw.findIndex((row, i) => {
+        if (specSectionIdx >= 0 && i <= specSectionIdx) return false
+        const headers = row.map(norm)
+        const propertyCol = headers.findIndex(h => specHeaderAliases.property.includes(h))
+        const valueCol = headers.findIndex((h, index) => index !== propertyCol && specHeaderAliases.value.includes(h))
+        return propertyCol >= 0 && valueCol >= 0
+      })
+      const specStartIdx = specHeaderIdx >= 0
+        ? specHeaderIdx + 1
+        : specSectionIdx >= 0 ? specSectionIdx + 1 : -1
+      const importedSpecs = []
+      if (specStartIdx >= 0) {
+        let propertyCol = 0
+        let valueCol = 1
+        if (specHeaderIdx >= 0) {
+          const specHeaders = raw[specHeaderIdx].map(norm)
+          propertyCol = specHeaders.findIndex(h => specHeaderAliases.property.includes(h))
+          valueCol = specHeaders.findIndex(h => specHeaderAliases.value.includes(h) && h !== specHeaders[propertyCol])
+          if (valueCol < 0) valueCol = specHeaders.findIndex((h, i) => i !== propertyCol && h)
+        }
+
+        let foundSpecRow = false
+        for (let i = specStartIdx; i < raw.length; i++) {
+          const row = raw[i]
+          if (!row.some(cell => String(cell).trim())) {
+            if (foundSpecRow) break
+            continue
+          }
+          if (row.some(cell => ['procedure', 'ingredients', 'formulationingredients', 'remarks'].includes(norm(cell)))) break
+          if (row.some(cell => ['property', 'test', 'parameter', 'characteristic', 'item'].includes(norm(cell)))) continue
+          const property = String(row[propertyCol] ?? '').trim()
+          const value = String(row[valueCol] ?? '').trim()
+          if (property && value) {
+            importedSpecs.push({ id: uid(), property, value })
+            foundSpecRow = true
+          }
         }
       }
 
       if (headerRowIdx < 0) {
         const found = Object.keys(formUpdates)
-        if (found.length) {
+        if (found.length || importedSpecs.length) {
           formDirty.current = true
-          setForm(f => ({ ...f, ...formUpdates }))
-          return alert(`✓ Filled: ${found.join(', ')}\n\nNo ingredient table found.`)
+          setForm(f => ({
+            ...f,
+            ...formUpdates,
+            specifications: importedSpecs.length ? mergeImportedSpecs(f.specifications || [], importedSpecs) : f.specifications,
+          }))
+          return alert(`✓ Filled: ${[...found, ...(importedSpecs.length ? ['specifications'] : [])].join(', ')}\n\nNo ingredient table found.`)
         }
         return alert('Could not find an ingredient table. Ensure column headers include: Trade Name, INCI Name, %, Supplier, Function')
       }
@@ -516,8 +591,13 @@ export default function FormulationSheet() {
       }
 
       formDirty.current = true
-      setForm(f => ({ ...f, ...formUpdates, ingredients: [...(f.ingredients || []), ...imported] }))
-      alert(`✓ Done!\nFilled: ${Object.keys(formUpdates).join(', ') || 'none'}\nIngredient rows: ${imported.length}\nColumns: ${Object.keys(colMap).join(', ')}`)
+      setForm(f => ({
+        ...f,
+        ...formUpdates,
+        ingredients: [...(f.ingredients || []), ...imported],
+        specifications: importedSpecs.length ? mergeImportedSpecs(f.specifications || [], importedSpecs) : f.specifications,
+      }))
+      alert(`✓ Done!\nFilled: ${[...Object.keys(formUpdates), ...(importedSpecs.length ? ['specifications'] : [])].join(', ') || 'none'}\nIngredient rows: ${imported.length}\nSpecification rows: ${importedSpecs.length}\nColumns: ${Object.keys(colMap).join(', ')}`)
     }
     reader.readAsArrayBuffer(file)
   }
